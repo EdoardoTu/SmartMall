@@ -1,0 +1,182 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Mall Digital Twin</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/mqtt/5.10.1/mqtt.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
+<style>
+:root{--bg:#f5f5f4;--card:#fff;--fg:#1c1917;--mut:#78716c;--bd:#d6d3d1;--ac:#2563eb;--ok:#16a34a}
+@media(prefers-color-scheme:dark){:root{--bg:#1c1917;--card:#292524;--fg:#fafaf9;--mut:#a8a29e;--bd:#57534e;--ac:#60a5fa}}
+*{box-sizing:border-box}body{margin:0;padding:16px;background:var(--bg);color:var(--fg);font:14px system-ui,sans-serif}
+header,.bar{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-bottom:14px}
+h1{font-size:19px;margin:0 10px 0 0}h2{font-size:15px;margin:0 0 6px}
+input,select,button{padding:6px 8px;border:1px solid var(--bd);border-radius:6px;background:var(--card);color:var(--fg);font:inherit}
+button{cursor:pointer}button.on{background:var(--ac);color:#fff;border-color:var(--ac)}
+.card{background:var(--card);border:1px solid var(--bd);border-radius:10px;padding:12px;margin-bottom:14px}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(340px,1fr));gap:14px}
+svg{width:100%;height:auto}.mut{color:var(--mut)}#badge{font-weight:600}
+</style>
+</head>
+<body>
+<header>
+  <h1>Mall Digital Twin</h1>
+  <button id="t1" class="on">Live</button><button id="t2">Analytics</button>
+  <button id="cfgb">Settings</button><span id="badge" class="mut"></span>
+</header>
+<div id="cfg" class="card" style="display:none">
+  <div class="bar">
+    <label>API URL <input id="api" size="42" placeholder="https://xxxx.execute-api.eu-west-1.amazonaws.com"></label>
+    <label>MQTT WebSocket (optional) <input id="mq" size="26" placeholder="wss://host:9001"></label>
+    <label>Heat max <input id="mx" type="number" min="1" style="width:60px"></label>
+    <button id="save">Save &amp; reload</button>
+  </div>
+  <div class="mut">Without an MQTT URL the live view polls the API every 15 s (data is 1-minute averages). A page served over https needs a wss:// broker.</div>
+</div>
+
+<section id="live">
+  <div class="grid" id="floors"></div>
+  <div class="mut">Heat = people per zone (camera). Boxes below = people currently inside each shop (entrance counters).</div>
+</section>
+
+<section id="ana" style="display:none">
+  <div class="bar">
+    <label>From <input id="from" type="datetime-local"></label>
+    <label>To <input id="to" type="datetime-local"></label>
+    <button id="load" class="on">Load</button><span id="msg" class="mut"></span>
+  </div>
+  <div class="grid">
+    <div class="card"><h2>People in mall over time (sum of cameras, hourly avg)</h2><canvas id="c1"></canvas></div>
+    <div class="card"><h2>Average presence by weekday</h2><canvas id="c2"></canvas></div>
+    <div class="card"><h2>Average presence by hour of day</h2><canvas id="c3"></canvas></div>
+    <div class="card"><h2>Average daily entries per shop</h2><canvas id="c4"></canvas></div>
+  </div>
+</section>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const get = (k, d) => { try { return localStorage.getItem(k) || d; } catch { return d; } };
+const cfg = { api: get("api", ""), mq: get("mq", ""), mx: +get("mx", 10) };
+$("api").value = cfg.api; $("mq").value = cfg.mq; $("mx").value = cfg.mx;
+$("save").onclick = () => { try { localStorage.setItem("api", $("api").value.trim()); localStorage.setItem("mq", $("mq").value.trim()); localStorage.setItem("mx", $("mx").value); } catch {} location.reload(); };
+$("cfgb").onclick = () => { const c = $("cfg"); c.style.display = c.style.display === "none" ? "block" : "none"; };
+const tab = (n) => { $("live").style.display = n === 1 ? "" : "none"; $("ana").style.display = n === 2 ? "" : "none"; $("t1").className = n === 1 ? "on" : ""; $("t2").className = n === 2 ? "on" : ""; };
+$("t1").onclick = () => tab(1); $("t2").onclick = () => tab(2);
+
+// layout: 2 floors x 2 cameras x 3 shops
+const CAMS = []; let sn = 1;
+for (let f = 1; f <= 2; f++) for (let c = 1; c <= 2; c++) CAMS.push({ id: `F${f}C${c}`, f, shops: [0, 1, 2].map(() => "S" + String(sn++).padStart(2, "0")) });
+const Z = {}, S = {};
+
+const heat = (v) => `rgba(239,68,68,${(0.06 + 0.8 * Math.min(1, (v || 0) / cfg.mx)).toFixed(2)})`;
+const r1 = (v) => Math.round((v || 0) * 10) / 10;
+const age = (ts) => { const s = (Date.now() - ts) / 1000; return s < 90 ? Math.round(s) + "s ago" : Math.round(s / 60) + "m ago"; };
+
+function floorSVG(f) {
+  let g = "";
+  CAMS.filter((c) => c.f === f).forEach((c, k) => {
+    const x0 = 10 + k * 315, z = Z[c.id] || {};
+    ["left", "center", "right"].forEach((n, i) => {
+      const x = x0 + i * 102, v = z[n];
+      g += `<rect x="${x}" y="46" width="98" height="104" rx="6" fill="${heat(v || 0)}" stroke="var(--bd)"/>
+        <text x="${x + 49}" y="104" text-anchor="middle" font-size="26" font-weight="600" fill="var(--fg)">${v == null ? "–" : r1(v)}</text>
+        <text x="${x + 49}" y="140" text-anchor="middle" font-size="11" fill="var(--mut)">${n}</text>`;
+    });
+    const live = z.ts && Date.now() - z.ts < 180000;
+    g += `<circle cx="${x0 + 12}" cy="22" r="8" fill="${live ? "var(--ok)" : "var(--mut)"}"/>
+      <text x="${x0 + 28}" y="26" font-size="12" fill="var(--fg)">Camera ${c.id}${z.ts ? " · " + age(z.ts) : ""}</text>`;
+    c.shops.forEach((id, i) => {
+      const x = x0 + i * 102, s = S[id] || {};
+      g += `<rect x="${x}" y="166" width="98" height="84" rx="6" fill="var(--card)" stroke="var(--bd)"/>
+        <text x="${x + 8}" y="186" font-size="11" fill="var(--mut)">Shop ${id}</text>
+        <text x="${x + 49}" y="224" text-anchor="middle" font-size="24" font-weight="600" fill="var(--fg)">${s.occ ?? "–"}</text>
+        <text x="${x + 49}" y="241" text-anchor="middle" font-size="10" fill="var(--mut)">inside</text>`;
+    });
+  });
+  return `<svg viewBox="0 0 640 262">${g}</svg>`;
+}
+
+function render() {
+  $("floors").innerHTML = [1, 2].map((f) => {
+    const cs = CAMS.filter((c) => c.f === f);
+    const p = cs.reduce((a, c) => a + (Z[c.id] ? (Z[c.id].left || 0) + (Z[c.id].center || 0) + (Z[c.id].right || 0) : 0), 0);
+    const sh = cs.reduce((a, c) => a + c.shops.reduce((b, id) => b + ((S[id] || {}).occ || 0), 0), 0);
+    return `<div class="card"><h2>Floor ${f} <span class="mut">· ${r1(p)} in corridors · ${sh} in shops</span></h2>${floorSVG(f)}</div>`;
+  }).join("");
+}
+
+const j = (path) => fetch(cfg.api.replace(/\/$/, "") + path).then((r) => { if (!r.ok) throw new Error(r.status); return r.json(); });
+
+async function loadLatest() {
+  if (!cfg.api) { $("badge").textContent = "Set the API URL in Settings"; return; }
+  try {
+    const d = await j("/latest");
+    if (d.zones) Object.assign(Z, d.zones);
+    if (d.shops) Object.assign(S, d.shops);
+    render();
+    if (!live) $("badge").textContent = "● API polling";
+  } catch (e) { $("badge").textContent = "API error: " + e.message; }
+}
+
+let live = false;
+loadLatest();
+setInterval(() => { if (!live) loadLatest(); }, 15000);
+setInterval(render, 10000);
+render();
+
+if (cfg.mq) {
+  const cl = mqtt.connect(cfg.mq, { clientId: "dash-" + Math.random().toString(16).slice(2, 8) });
+  cl.on("connect", () => { live = true; $("badge").textContent = "● MQTT live"; cl.subscribe("mall/#"); });
+  cl.on("close", () => { live = false; $("badge").textContent = "MQTT lost, polling API"; });
+  cl.on("message", (t, m) => {
+    try {
+      const d = JSON.parse(m.toString());
+      if (t.endsWith("/zones")) Z[d.camera_id] = { ...d.zones, ts: d.ts };
+      else if (t.includes("/shop/")) S[d.shop_id] = { occ: d.occupancy, ts: d.ts };
+      else return;
+      render();
+    } catch {}
+  });
+}
+
+// ---- analytics ----
+const iso = (d) => new Date(d - d.getTimezoneOffset() * 6e4).toISOString().slice(0, 16);
+$("to").value = iso(new Date()); $("from").value = iso(new Date(Date.now() - 7 * 864e5));
+
+const charts = {};
+function chart(id, type, labels, data, label) {
+  if (charts[id]) charts[id].destroy();
+  charts[id] = new Chart($(id), { type, data: { labels, datasets: [{ label, data, borderColor: "#2563eb", backgroundColor: "rgba(37,99,235,.55)", pointRadius: 0, tension: .25 }] }, options: { plugins: { legend: { display: false } } } });
+}
+
+const avgBy = (rows, key, n) => { const s = Array(n).fill(0), c = Array(n).fill(0); rows.forEach(([t, v]) => { const k = key(new Date(t)); s[k] += v; c[k]++; }); return s.map((v, i) => c[i] ? r1(v / c[i]) : 0); };
+
+$("load").onclick = async () => {
+  if (!cfg.api) return ($("msg").textContent = "Set the API URL first");
+  $("msg").textContent = "Loading…";
+  const from = new Date($("from").value).getTime(), to = new Date($("to").value).getTime();
+  const q = `&from=${from}&to=${to}&bucket=60`;
+  try {
+    const [z, s] = await Promise.all([j("/history?kind=zones" + q), j("/history?kind=shops" + q)]);
+    const zRows = z.rows || [], sRows = s.rows || [];
+    
+    const byT = {}; zRows.forEach((r) => byT[r.t] = (byT[r.t] || 0) + (r.total || 0));
+    const ts = Object.keys(byT).map(Number).sort((a, b) => a - b), rows = ts.map((t) => [t, byT[t]]);
+    
+    chart("c1", "line", ts.map((t) => new Date(t).toLocaleString([], { day: "2-digit", month: "2-digit", hour: "2-digit" })), ts.map((t) => r1(byT[t])), "People");
+    const wd = avgBy(rows, (d) => (d.getDay() + 6) % 7, 7);
+    chart("c2", "bar", ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"], wd, "Avg people");
+    chart("c3", "bar", [...Array(24).keys()].map((h) => h + ":00"), avgBy(rows, (d) => d.getHours(), 24), "Avg people");
+    
+    const days = Math.max(1, (to - from) / 864e5), ent = {};
+    sRows.forEach((r) => ent[r.id] = (ent[r.id] || 0) + (r.entries || 0));
+    
+    const ids = CAMS.flatMap((c) => c.shops);
+    chart("c4", "bar", ids, ids.map((id) => r1((ent[id] || 0) / days)), "Entries/day");
+    $("msg").textContent = `${zRows.length} zone rows, ${sRows.length} shop rows`;
+  } catch (e) { $("msg").textContent = "Error: " + e.message; }
+};
+</script>
+</body>
+</html>

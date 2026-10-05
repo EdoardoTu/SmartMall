@@ -1,0 +1,129 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Mall Simulator</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/mqtt/5.10.1/mqtt.min.js"></script>
+<style>
+  :root { --bg:#f5f5f4; --card:#fff; --fg:#1c1917; --mut:#78716c; --bd:#e7e5e4; --ac:#2563eb; --ok:#16a34a; --bad:#dc2626; }
+  @media (prefers-color-scheme: dark) { :root { --bg:#1c1917; --card:#292524; --fg:#fafaf9; --mut:#a8a29e; --bd:#44403c; --ac:#60a5fa; } }
+  * { box-sizing:border-box; }
+  body { margin:0; padding:20px; background:var(--bg); color:var(--fg); font:14px system-ui,sans-serif; }
+  header { display:flex; gap:12px; align-items:center; flex-wrap:wrap; margin-bottom:16px; }
+  h1 { font-size:20px; margin:0 12px 0 0; }
+  input[type=text] { padding:6px 8px; border:1px solid var(--bd); border-radius:6px; background:var(--card); color:var(--fg); width:220px; }
+  button { padding:6px 12px; border:1px solid var(--bd); border-radius:6px; background:var(--card); color:var(--fg); cursor:pointer; }
+  button.p { background:var(--ac); color:#fff; border-color:var(--ac); }
+  #st { font-weight:600; } .on{color:var(--ok)} .off{color:var(--bad)}
+  .floor { margin-bottom:24px; } .floor h2 { font-size:16px; margin:0 0 8px; }
+  .row { display:grid; grid-template-columns:repeat(auto-fit,minmax(340px,1fr)); gap:12px; }
+  .cam { background:var(--card); border:1px solid var(--bd); border-radius:10px; padding:14px; }
+  .cam h3 { margin:0 0 10px; font-size:15px; display:flex; justify-content:space-between; align-items:center; }
+  .zones { display:grid; grid-template-columns:repeat(3,1fr); gap:8px; margin-bottom:12px; }
+  .zone { text-align:center; } .zone label { display:block; color:var(--mut); font-size:12px; margin-bottom:4px; }
+  .zone input { width:100%; text-align:center; padding:6px; border:1px solid var(--bd); border-radius:6px; background:var(--bg); color:var(--fg); }
+  .shop { display:flex; align-items:center; gap:8px; padding:6px 0; border-top:1px solid var(--bd); }
+  .shop b { width:38px; } .occ { width:34px; text-align:center; font-weight:600; font-size:16px; }
+  .shop .mut { color:var(--mut); font-size:12px; flex:1; }
+  #log { background:var(--card); border:1px solid var(--bd); border-radius:10px; padding:10px; height:150px; overflow:auto; font:12px ui-monospace,monospace; color:var(--mut); }
+</style>
+</head>
+<body>
+<header>
+  <h1>Mall simulator</h1>
+  <input id="url" type="text" value="ws://localhost:9001">
+  <button class="p" id="conn">Connect</button>
+  <span id="st" class="off">disconnected</span>
+  <label><input type="checkbox" id="auto" checked> auto-publish every 2 s</label>
+</header>
+<div id="app"></div>
+<h2 style="font-size:16px">Published messages</h2>
+<div id="log"></div>
+
+<script>
+// 2 floors x 2 cameras x 3 shops = 12 shops
+const cams = [];
+let s = 1;
+for (let f = 1; f <= 2; f++) for (let c = 1; c <= 2; c++) {
+  const shops = [];
+  for (let i = 0; i < 3; i++) shops.push({ id: "S" + String(s++).padStart(2, "0"), occ: 0, in: 0, out: 0 });
+  cams.push({ floor: f, cam: c, id: `F${f}C${c}`, zones: { left: 0, center: 0, right: 0 }, shops });
+}
+
+let client = null;
+const $ = (id) => document.getElementById(id);
+const log = (t) => { const l = $("log"); l.innerHTML = `${new Date().toLocaleTimeString()}  ${t}<br>` + l.innerHTML; };
+
+function pub(topic, obj) {
+  if (!client || !client.connected) return log("not connected");
+  client.publish(topic, JSON.stringify(obj), { qos: 1, retain: true });
+  log(`${topic}  ${JSON.stringify(obj)}`);
+}
+
+function pubZones(c) {
+  const z = c.zones;
+  pub(`mall/floor${c.floor}/cam${c.cam}/zones`, {
+    camera_id: c.id, floor: c.floor, ts: Date.now(), zones: { ...z },
+    total: z.left + z.center + z.right, source: "sim"
+  });
+}
+
+function pubShop(c, sh) {
+  pub(`mall/floor${c.floor}/cam${c.cam}/shop/${sh.id}/count`, {
+    shop_id: sh.id, camera_id: c.id, floor: c.floor, ts: Date.now(),
+    occupancy: sh.occ, entered: sh.in, exited: sh.out, source: "sim"
+  });
+}
+
+function render() {
+  $("app").innerHTML = "";
+  [1, 2].forEach((f) => {
+    const box = document.createElement("div");
+    box.className = "floor";
+    box.innerHTML = `<h2>Floor ${f}</h2><div class="row"></div>`;
+    cams.filter((c) => c.floor === f).forEach((c) => {
+      const el = document.createElement("div");
+      el.className = "cam";
+      el.innerHTML = `<h3>Camera ${c.id} <button data-a="pz">Publish zones</button></h3>
+        <div class="zones">${["left", "center", "right"].map((z) =>
+          `<div class="zone"><label>${z}</label><input type="number" min="0" value="${c.zones[z]}" data-z="${z}"></div>`).join("")}</div>
+        ${c.shops.map((sh) => `<div class="shop" data-s="${sh.id}">
+          <b>${sh.id}</b><button data-a="out">−1 exit</button>
+          <span class="occ">${sh.occ}</span><button data-a="in">+1 entry</button>
+          <span class="mut">in ${sh.in} / out ${sh.out}</span></div>`).join("")}`;
+      el.querySelectorAll("input[data-z]").forEach((i) => i.oninput = () => {
+        c.zones[i.dataset.z] = Math.max(0, parseInt(i.value) || 0);
+      });
+      el.querySelector('[data-a="pz"]').onclick = () => pubZones(c);
+      el.querySelectorAll(".shop").forEach((row) => {
+        const sh = c.shops.find((x) => x.id === row.dataset.s);
+        row.querySelector('[data-a="in"]').onclick = () => { sh.in++; sh.occ++; pubShop(c, sh); render(); };
+        row.querySelector('[data-a="out"]').onclick = () => { if (sh.occ > 0) { sh.out++; sh.occ--; pubShop(c, sh); render(); } };
+      });
+      box.querySelector(".row").appendChild(el);
+    });
+    $("app").appendChild(box);
+  });
+}
+
+$("conn").onclick = () => {
+  if (client) client.end(true);
+  client = mqtt.connect($("url").value, { clientId: "sim-ui-" + Math.random().toString(16).slice(2, 8) });
+  client.on("connect", () => {
+    $("st").textContent = "connected"; $("st").className = "on";
+    cams.forEach((c) => client.publish(`mall/floor${c.floor}/cam${c.cam}/status`,
+      JSON.stringify({ camera_id: c.id, online: true, source: "sim" }), { qos: 1, retain: true }));
+  });
+  client.on("close", () => { $("st").textContent = "disconnected"; $("st").className = "off"; });
+  client.on("error", (e) => log("error: " + e.message));
+};
+
+setInterval(() => {
+  if ($("auto").checked && client && client.connected) cams.forEach(pubZones);
+}, 2000);
+
+render();
+</script>
+</body>
+</html>
